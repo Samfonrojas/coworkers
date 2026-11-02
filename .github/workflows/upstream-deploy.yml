@@ -1,0 +1,113 @@
+name: Deploy upstream Coworkers
+
+on:
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: coworkers-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      CF_SEND_TELEMETRY: "false"
+      GH_REPO: ${{ github.repository }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Checkout upstream
+        uses: actions/checkout@v4
+        with:
+          repository: fayazara/coworkers
+          ref: main
+          path: app
+          fetch-depth: 1
+
+      - name: Resolve upstream SHA
+        id: sha
+        working-directory: app
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Check last deployed SHA
+        id: check
+        run: |
+          LAST="$(gh variable get LAST_DEPLOYED_SHA 2>/dev/null || true)"
+          if [ "$LAST" = "${{ steps.sha.outputs.sha }}" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Upstream is already deployed: $LAST"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "New upstream commit: ${{ steps.sha.outputs.sha }}"
+          fi
+
+      - name: Setup Node
+        if: steps.check.outputs.changed == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup pnpm
+        if: steps.check.outputs.changed == 'true'
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Write deployment config
+        if: steps.check.outputs.changed == 'true'
+        working-directory: app
+        env:
+          COWORKERS_DEPLOY_JSON: ${{ secrets.COWORKERS_DEPLOY_JSON }}
+        run: |
+          printf '%s\n' "$COWORKERS_DEPLOY_JSON" > coworkers.deploy.json
+          printf '{}\n' > empty-secrets.json
+
+      - name: Install dependencies
+        if: steps.check.outputs.changed == 'true'
+        working-directory: app
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        if: steps.check.outputs.changed == 'true'
+        working-directory: app
+        run: pnpm typecheck
+
+      - name: Test
+        if: steps.check.outputs.changed == 'true'
+        working-directory: app
+        run: pnpm test
+
+      - name: Build
+        if: steps.check.outputs.changed == 'true'
+        working-directory: app
+        run: pnpm build
+
+      - name: Deploy
+        if: steps.check.outputs.changed == 'true'
+        working-directory: app
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          UPSTREAM_SHA: ${{ steps.sha.outputs.sha }}
+        run: |
+          pnpm exec cf deploy --prebuilt --mode production \
+            --secrets-file empty-secrets.json \
+            --message "upstream ${UPSTREAM_SHA}" \
+            --tag "upstream-${UPSTREAM_SHA:0:7}-${GITHUB_RUN_ID}"
+
+      - name: Smoke test
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          code="$(curl -sS -o /dev/null -w '%{http_code}' https://coworkers.samfonrojas.workers.dev/)"
+          echo "HTTP $code"
+          test "$code" -lt 500
+
+      - name: Remember deployed SHA
+        if: steps.check.outputs.changed == 'true'
+        continue-on-error: true
+        run: gh variable set LAST_DEPLOYED_SHA --body "${{ steps.sha.outputs.sha }}"
