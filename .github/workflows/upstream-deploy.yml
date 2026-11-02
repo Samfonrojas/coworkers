@@ -47,19 +47,19 @@ jobs:
           fi
 
       - name: Setup Node
-        if: steps.check.outputs.changed == 'true'
+        if: success() && steps.check.outputs.changed == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: 22
 
       - name: Setup pnpm
-        if: steps.check.outputs.changed == 'true'
+        if: success() && steps.check.outputs.changed == 'true'
         uses: pnpm/action-setup@v4
         with:
           version: 10
 
       - name: Write deployment config
-        if: steps.check.outputs.changed == 'true'
+        if: success() && steps.check.outputs.changed == 'true'
         working-directory: app
         env:
           COWORKERS_DEPLOY_JSON: ${{ secrets.COWORKERS_DEPLOY_JSON }}
@@ -68,27 +68,39 @@ jobs:
           printf '{}\n' > empty-secrets.json
 
       - name: Install dependencies
-        if: steps.check.outputs.changed == 'true'
+        if: success() && steps.check.outputs.changed == 'true'
         working-directory: app
         run: pnpm install --frozen-lockfile
 
+      - name: Read previous version
+        id: previous
+        if: success() && steps.check.outputs.changed == 'true'
+        working-directory: app
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          pnpm exec cf workers deployments list --worker coworkers > /tmp/deployments.json
+          node -e "const fs=require('fs'); const d=JSON.parse(fs.readFileSync('/tmp/deployments.json','utf8')); const v=d.deployments?.[0]?.versions?.[0]?.version_id; if(!v){process.exit(1)}; console.log('version='+v)" >> "$GITHUB_OUTPUT"
+
       - name: Typecheck
-        if: steps.check.outputs.changed == 'true'
+        if: success() && steps.check.outputs.changed == 'true'
         working-directory: app
         run: pnpm typecheck
 
       - name: Test
-        if: steps.check.outputs.changed == 'true'
+        if: success() && steps.check.outputs.changed == 'true'
         working-directory: app
         run: pnpm test
 
       - name: Build
-        if: steps.check.outputs.changed == 'true'
+        if: success() && steps.check.outputs.changed == 'true'
         working-directory: app
         run: pnpm build
 
       - name: Deploy
-        if: steps.check.outputs.changed == 'true'
+        id: deploy
+        if: success() && steps.check.outputs.changed == 'true'
         working-directory: app
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -101,13 +113,28 @@ jobs:
             --tag "upstream-${UPSTREAM_SHA:0:7}-${GITHUB_RUN_ID}"
 
       - name: Smoke test
-        if: steps.check.outputs.changed == 'true'
+        id: smoke
+        if: success() && steps.check.outputs.changed == 'true'
         run: |
           code="$(curl -sS -o /dev/null -w '%{http_code}' https://coworkers.samfonrojas.workers.dev/)"
           echo "HTTP $code"
           test "$code" -lt 500
 
+      - name: Roll back
+        if: failure() && steps.deploy.outcome == 'success' && steps.smoke.outcome == 'failure'
+        working-directory: app
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          PREVIOUS_VERSION: ${{ steps.previous.outputs.version }}
+        run: |
+          pnpm exec cf workers deployments create \
+            --worker coworkers \
+            --strategy percentage \
+            --bypass-deployment-checks \
+            --versions "[{\"version_id\":\"${PREVIOUS_VERSION}\",\"percentage\":100}]"
+
       - name: Remember deployed SHA
-        if: steps.check.outputs.changed == 'true'
+        if: success() && steps.check.outputs.changed == 'true'
         continue-on-error: true
         run: gh variable set LAST_DEPLOYED_SHA --body "${{ steps.sha.outputs.sha }}"
