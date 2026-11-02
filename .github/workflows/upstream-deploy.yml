@@ -50,14 +50,23 @@ jobs:
             exit 0
           fi
           curl -fsS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/coworkers/deployments" \
+            -o /tmp/deployments.json
+          ACTIVE="$(jq -r '.result.deployments[0].versions[0].version_id // empty' /tmp/deployments.json)"
+          if [ -z "$ACTIVE" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "No active deployment; deploying $UPSTREAM_SHA"
+            exit 0
+          fi
+          curl -fsS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
             "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/coworkers/versions" \
             -o /tmp/versions.json
-          if jq -e --arg sha "$UPSTREAM_SHA" '.result.items[] | select(.annotations["workers/message"] == ("upstream " + $sha))' /tmp/versions.json > /dev/null; then
+          if jq -e --arg id "$ACTIVE" --arg sha "$UPSTREAM_SHA" '.result.items[] | select(.id == $id) | .annotations["workers/message"] == ("upstream " + $sha)' /tmp/versions.json > /dev/null; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Already deployed: $UPSTREAM_SHA"
+            echo "Active version $ACTIVE is already $UPSTREAM_SHA"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "New upstream commit: $UPSTREAM_SHA"
+            echo "Active version $ACTIVE is not $UPSTREAM_SHA"
           fi
 
       - name: Setup Node
