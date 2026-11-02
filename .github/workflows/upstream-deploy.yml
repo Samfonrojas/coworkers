@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "0 9 * * *"
   workflow_dispatch:
+    inputs:
+      force:
+        description: Deploy even if this upstream SHA is already live
+        type: boolean
+        default: false
 
 concurrency:
   group: coworkers-production
@@ -11,15 +16,12 @@ concurrency:
 
 permissions:
   contents: read
-  actions: write
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
       CF_SEND_TELEMETRY: "false"
-      GH_REPO: ${{ github.repository }}
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - name: Checkout upstream
         uses: actions/checkout@v4
@@ -34,16 +36,28 @@ jobs:
         working-directory: app
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Check last deployed SHA
+      - name: Check deployed versions
         id: check
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          UPSTREAM_SHA: ${{ steps.sha.outputs.sha }}
+          FORCE: ${{ inputs.force }}
         run: |
-          LAST="$(gh variable get LAST_DEPLOYED_SHA 2>/dev/null || true)"
-          if [ "$LAST" = "${{ steps.sha.outputs.sha }}" ]; then
+          if [ "$FORCE" = "true" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Forced deploy for $UPSTREAM_SHA"
+            exit 0
+          fi
+          curl -fsS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/coworkers/versions" \
+            -o /tmp/versions.json
+          if jq -e --arg sha "$UPSTREAM_SHA" '.result.items[] | select(.annotations["workers/message"] == ("upstream " + $sha))' /tmp/versions.json > /dev/null; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Upstream is already deployed: $LAST"
+            echo "Already deployed: $UPSTREAM_SHA"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "New upstream commit: ${{ steps.sha.outputs.sha }}"
+            echo "New upstream commit: $UPSTREAM_SHA"
           fi
 
       - name: Setup Node
@@ -134,7 +148,3 @@ jobs:
             --bypass-deployment-checks \
             --versions "[{\"version_id\":\"${PREVIOUS_VERSION}\",\"percentage\":100}]"
 
-      - name: Remember deployed SHA
-        if: success() && steps.check.outputs.changed == 'true'
-        continue-on-error: true
-        run: gh variable set LAST_DEPLOYED_SHA --body "${{ steps.sha.outputs.sha }}"
